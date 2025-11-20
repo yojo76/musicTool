@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const tempoValue = document.getElementById('tempo-value');
     const volumeInput = document.getElementById('volume');
     const volumeValue = document.getElementById('volume-value');
+    const metronomeBtn = document.getElementById('btn-metronome');
     const playBtn = document.getElementById('btn-play');
     const saveBtn = document.getElementById('btn-save');
     const fileInput = document.getElementById('file-input');
@@ -30,12 +31,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const LINE_SPACING = 10;
     const NOTE_RADIUS = 5;
 
-    // --- State ---
+    // --- Audio Engine State (Lookahead Scheduler) ---
     let audioCtx = null;
-    let parsedStaves = [];
-    let isPlaying = false;
-    let currentlyPlaying = null; // { staffIndex, noteIndex }
-    let playbackTimeouts = []; // To clear on stop
+    let parsedStaves = []; // Array of arrays of notes
+
+    // Timing
+    let lookahead = 25.0; // ms
+    let scheduleAheadTime = 0.1; // s
+    let nextBeatTime = 0.0; // When the next beat (metronome click) is due
+    let beatCount = 0; // Current beat number (for sync)
+    let tempo = 120.0;
+    let timerID = null;
+
+    // Metronome State
+    let isMetronomeOn = false;
+
+    // Playback State
+    let isMusicPlaying = false;
+    let musicStartTime = 0; // The exact time the music started (aligned to beat)
+    let musicCurrentNoteIndices = []; // [noteIndexForStaff0, noteIndexForStaff1...]
+    let scheduledNotes = []; // To track for visualization { time, staffIndex, noteIndex }
 
     // --- Initialization ---
     function init() {
@@ -44,6 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         tempoInput.addEventListener('input', (e) => {
             tempoValue.textContent = e.target.value;
+            tempo = parseFloat(e.target.value);
         });
 
         volumeInput.addEventListener('input', (e) => {
@@ -55,12 +71,16 @@ document.addEventListener('DOMContentLoaded', () => {
             drawStaff();
         });
 
-        playBtn.addEventListener('click', playComposition);
+        metronomeBtn.addEventListener('click', toggleMetronome);
+        playBtn.addEventListener('click', startMusicPlayback);
         saveBtn.addEventListener('click', saveComposition);
         fileInput.addEventListener('change', loadComposition);
 
         parseComposition();
         drawStaff();
+
+        // Start the visual loop
+        requestAnimationFrame(drawLoop);
     }
 
     function resizeCanvas() {
@@ -128,7 +148,271 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // --- Visualization Logic ---
+    // --- Audio Scheduler ---
+
+    function initAudio() {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+    }
+
+    function toggleMetronome() {
+        initAudio();
+        isMetronomeOn = !isMetronomeOn;
+
+        if (isMetronomeOn) {
+            metronomeBtn.textContent = "Metronome ON";
+            metronomeBtn.classList.add('active');
+            statusText.textContent = "Metronome ON";
+
+            // Start the scheduler if not already running
+            // If music is not playing, we need to kickstart the loop
+            if (!isMusicPlaying && !timerID) {
+                nextBeatTime = audioCtx.currentTime + 0.1;
+                beatCount = 0;
+                timerID = setInterval(scheduler, lookahead);
+            }
+        } else {
+            metronomeBtn.textContent = "Metronome";
+            metronomeBtn.classList.remove('active');
+            statusText.textContent = "Metronome OFF";
+
+            // If music is NOT playing, stop the scheduler
+            if (!isMusicPlaying) {
+                clearInterval(timerID);
+                timerID = null;
+            }
+        }
+    }
+
+    function startMusicPlayback() {
+        initAudio();
+        if (isMusicPlaying) return; // Already playing? (Though button is disabled)
+
+        if (parsedStaves.length === 0) {
+            statusText.textContent = "No notes to play.";
+            return;
+        }
+
+        playBtn.disabled = true;
+
+        // Reset music indices
+        musicCurrentNoteIndices = new Array(parsedStaves.length).fill(0);
+        scheduledNotes = [];
+
+        // Sync Logic
+        if (isMetronomeOn) {
+            statusText.textContent = "Waiting for metronome...";
+            // The music will start at the *next* beat time calculated by the scheduler
+            // We set a flag to tell the scheduler "Music wants to start at nextBeatTime"
+            musicStartTime = nextBeatTime; // Will be refined in scheduler?
+            // Actually, simpler:
+            // We just set isMusicPlaying = true.
+            // The scheduler loop will see this.
+            // We need to ensure we align with the grid.
+            // Let's say music starts at the exact time of the *next* scheduled beat.
+            musicStartTime = nextBeatTime;
+        } else {
+            // Start immediately (with small buffer)
+            musicStartTime = audioCtx.currentTime + 0.1;
+            nextBeatTime = musicStartTime; // Align grid to now
+            beatCount = 0;
+            statusText.textContent = "Playing...";
+
+            // Start scheduler if not running
+            if (!timerID) {
+                timerID = setInterval(scheduler, lookahead);
+            }
+        }
+
+        isMusicPlaying = true;
+        // If we waited, the status text update happens when the first note plays?
+        // Or we leave "Waiting..." until time hits.
+    }
+
+    function scheduler() {
+        // While there are notes that will play closer than scheduleAheadTime
+        while (nextBeatTime < audioCtx.currentTime + scheduleAheadTime) {
+            scheduleBeat(nextBeatTime, beatCount);
+
+            // Advance time
+            const secondsPerBeat = 60.0 / tempo;
+            nextBeatTime += secondsPerBeat;
+            beatCount++;
+        }
+    }
+
+    function scheduleBeat(time, beat) {
+        // 1. Play Metronome Click if ON
+        if (isMetronomeOn) {
+            playMetronomeClick(time);
+        }
+
+        // 2. Play Music Notes if ON and Time >= musicStartTime
+        if (isMusicPlaying && time >= musicStartTime) {
+            // We treat the "time" as the start of the beat.
+            // We assume one note per beat for simplicity based on previous implementation.
+            // (Requirement: "Do Re Mi..." usually quarter notes).
+
+            let notesPlayedOrFinished = false;
+            let anyStaffHasNotes = false;
+
+            // For each staff
+            parsedStaves.forEach((staff, sIndex) => {
+                const nIndex = musicCurrentNoteIndices[sIndex];
+
+                if (nIndex < staff.length) {
+                    anyStaffHasNotes = true;
+                    const note = staff[nIndex];
+
+                    // Schedule Audio
+                    if (note.type === 'note') {
+                        playNoteAudio(note.freq, time, 60.0 / tempo);
+                    }
+
+                    // Schedule Visual Update (push to queue)
+                    scheduledNotes.push({
+                        time: time,
+                        staffIndex: sIndex,
+                        noteIndex: nIndex
+                    });
+
+                    // Increment index for this staff
+                    musicCurrentNoteIndices[sIndex]++;
+                }
+            });
+
+            // Check if all staves are finished
+            // If for this beat, no staff had a note to play (because all are finished), stop.
+            if (!anyStaffHasNotes) {
+                stopMusic();
+            } else {
+                if (statusText.textContent === "Waiting for metronome...") {
+                    statusText.textContent = "Playing...";
+                }
+            }
+        }
+    }
+
+    function stopMusic() {
+        isMusicPlaying = false;
+        playBtn.disabled = false;
+        statusText.textContent = isMetronomeOn ? "Metronome ON" : "Playback complete";
+
+        // If Metronome is OFF, stop the scheduler loop completely
+        if (!isMetronomeOn) {
+            clearInterval(timerID);
+            timerID = null;
+        }
+    }
+
+    function playMetronomeClick(time) {
+        const osc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.value = 800;
+        gainNode.gain.setValueAtTime(0.3, time);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
+        osc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        osc.start(time);
+        osc.stop(time + 0.1);
+    }
+
+    function playNoteAudio(freq, time, duration) {
+        const osc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+
+        osc.type = getInstrumentSettings();
+        osc.frequency.value = freq;
+
+        const vol = parseInt(volumeInput.value) / 100;
+
+        // Attack/Release
+        gainNode.gain.setValueAtTime(0, time);
+        gainNode.gain.linearRampToValueAtTime(vol, time + 0.05);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, time + duration - 0.05);
+
+        osc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+
+        osc.start(time);
+        osc.stop(time + duration);
+    }
+
+    function getInstrumentSettings() {
+        const inst = instrumentSelect.value;
+        switch (inst) {
+            case 'piano': return 'triangle';
+            case 'guitar': return 'sawtooth';
+            case 'harmonica': return 'square';
+            case 'clarinet': return 'triangle';
+            default: return 'sine';
+        }
+    }
+
+    // --- Visual Loop (Syncs with Audio Time) ---
+    function drawLoop() {
+        if (isMusicPlaying || scheduledNotes.length > 0) {
+            const currentTime = audioCtx ? audioCtx.currentTime : 0;
+            let needDraw = false;
+
+            // Check scheduled notes
+            // We want to highlight the note that is *currently* playing (time <= currentTime < time + duration)
+            // But since we only schedule exact beat times, we just check the latest passed beat.
+
+            // Find the latest note for each staff that has started
+            let activeNotes = null;
+
+            // Filter out old notes (older than 1 beat duration + extra)
+            const duration = 60.0 / tempo;
+
+            // Clean up old scheduled notes
+            while (scheduledNotes.length > 0 && scheduledNotes[0].time < currentTime - duration) {
+                scheduledNotes.shift();
+            }
+
+            // Determine currently playing (the one with time <= currentTime and closest to currentTime)
+            // We might have multiple simultaneous notes (different staves)
+            // Group by staff
+            // Actually we just want to know which one to highlight.
+            // Highlighting logic: Highlight note if currentTime is within [note.time, note.time + duration]
+
+            currentlyPlaying = null; // Global var used by drawStaff
+
+            // We need a structure that drawStaff understands.
+            // currentlyPlaying was { staffIndex, noteIndex }
+            // But we support multiple staves playing at once now.
+            // Let's update drawStaff to support an array or map of highlights?
+            // For now, let's just highlight the *latest* started note for each staff?
+            // Or simplified: Just redraw if scheduledNotes has something active.
+
+            // Let's verify if we need to update the "currentlyPlaying" state
+            // Find active notes
+            const active = scheduledNotes.filter(n => currentTime >= n.time && currentTime < n.time + duration);
+
+            if (active.length > 0) {
+                 // We need to change drawStaff to handle multiple highlights?
+                 // For now, let's just highlight one for simplicity or modify drawStaff.
+                 // Let's modify drawStaff to accept a list of highlights.
+                 currentlyPlaying = active; // Assign array
+                 needDraw = true;
+            } else {
+                if (currentlyPlaying !== null) {
+                    currentlyPlaying = null;
+                    needDraw = true;
+                }
+            }
+
+            if (needDraw) {
+                drawStaff();
+            }
+        }
+
+        requestAnimationFrame(drawLoop);
+    }
+
+    // --- Visualization Logic (Updated for Multi-Highlight) ---
     function drawStaff() {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.strokeStyle = '#000';
@@ -156,9 +440,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const spacingX = 40;
 
             staffNotes.forEach((note, noteIndex) => {
-                const isHighlighted = currentlyPlaying &&
-                                      currentlyPlaying.staffIndex === staffIndex &&
-                                      currentlyPlaying.noteIndex === noteIndex;
+                // Check highlight
+                let isHighlighted = false;
+                if (currentlyPlaying) {
+                    // It's an array now
+                    if (Array.isArray(currentlyPlaying)) {
+                        isHighlighted = currentlyPlaying.some(n => n.staffIndex === staffIndex && n.noteIndex === noteIndex);
+                    } else if (currentlyPlaying.staffIndex === staffIndex && currentlyPlaying.noteIndex === noteIndex) {
+                         isHighlighted = true;
+                    }
+                }
 
                 ctx.fillStyle = isHighlighted ? '#e74c3c' : '#000';
                 ctx.strokeStyle = isHighlighted ? '#e74c3c' : '#000';
@@ -204,114 +495,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // --- Audio Engine ---
-    function playTone(freq, duration, type = 'sine', vol = 1) {
-        if (!audioCtx) return;
-
-        const osc = audioCtx.createOscillator();
-        const gainNode = audioCtx.createGain();
-
-        osc.type = type;
-        osc.frequency.value = freq;
-
-        // Envelope
-        const now = audioCtx.currentTime;
-        const attack = 0.05;
-        const release = 0.1;
-
-        // Gain Control
-        gainNode.gain.setValueAtTime(0, now);
-        gainNode.gain.linearRampToValueAtTime(vol, now + attack);
-        gainNode.gain.exponentialRampToValueAtTime(0.001, now + duration - release);
-
-        osc.connect(gainNode);
-        gainNode.connect(audioCtx.destination);
-
-        osc.start(now);
-        osc.stop(now + duration);
-    }
-
-    function getInstrumentSettings() {
-        const inst = instrumentSelect.value;
-        let type = 'sine';
-        // Simple instrument approximation
-        switch (inst) {
-            case 'piano': type = 'triangle'; break; // Soft, slight harmonics
-            case 'guitar': type = 'sawtooth'; break; // Sharper
-            case 'harmonica': type = 'square'; break; // Hollow
-            case 'clarinet': type = 'triangle'; break; // Woodwindy (simulated)
-            default: type = 'sine';
-        }
-        return type;
-    }
-
-    async function playComposition() {
-        if (isPlaying) return;
-
-        // Init Audio Context on user interaction
-        if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        }
-
-        if (parsedStaves.length === 0) {
-            statusText.textContent = "No notes to play.";
-            return;
-        }
-
-        isPlaying = true;
-        playBtn.disabled = true;
-        statusText.textContent = "Playing...";
-
-        // Flatten staves into a single sequence for linear playback?
-        // Requirement: "Input can be spread across multiple lines... intended for a separate staff".
-        // Usually this means played sequentially (Line 1 then Line 2...) or simultaneously?
-        // Standard notation editors play vertically (simultaneously) if they are parts,
-        // OR horizontally if it's just wrapping.
-        // Given the UI "lines of text input", it implies continuous melody usually.
-        // Let's assume SEQUENTIAL playback (Staff 1, then Staff 2...) for a simple melody tool.
-
-        const bpm = parseInt(tempoInput.value);
-        const beatDuration = 60 / bpm; // Seconds per beat
-        const volume = parseInt(volumeInput.value) / 100;
-        const instrumentType = getInstrumentSettings();
-
-        let totalDelay = 0;
-
-        for (let sIndex = 0; sIndex < parsedStaves.length; sIndex++) {
-            const staff = parsedStaves[sIndex];
-
-            for (let nIndex = 0; nIndex < staff.length; nIndex++) {
-                const note = staff[nIndex];
-
-                // Visual Highlight Schedule
-                const startTimeout = setTimeout(() => {
-                    currentlyPlaying = { staffIndex: sIndex, noteIndex: nIndex };
-                    drawStaff();
-
-                    // Play Sound
-                    if (note.type === 'note') {
-                        playTone(note.freq, beatDuration, instrumentType, volume);
-                    }
-                }, totalDelay * 1000);
-
-                playbackTimeouts.push(startTimeout);
-
-                totalDelay += beatDuration;
-            }
-        }
-
-        // Cleanup after finish
-        const endTimeout = setTimeout(() => {
-            currentlyPlaying = null;
-            drawStaff();
-            isPlaying = false;
-            playBtn.disabled = false;
-            statusText.textContent = "Playback complete";
-            playbackTimeouts = [];
-        }, totalDelay * 1000);
-        playbackTimeouts.push(endTimeout);
-    }
-
     // --- File I/O ---
     function saveComposition() {
         const text = compositionInput.value;
@@ -337,7 +520,6 @@ document.addEventListener('DOMContentLoaded', () => {
             drawStaff();
         };
         reader.readAsText(file);
-        // Reset input so same file can be selected again
         e.target.value = '';
     }
 

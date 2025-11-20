@@ -84,6 +84,15 @@ button:disabled {
     cursor: not-allowed;
 }
 
+button.secondary-btn {
+    background-color: #95a5a6;
+}
+
+button.secondary-btn.active {
+    background-color: var(--primary-color); /* Blue when active */
+    font-weight: bold;
+}
+
 input[type="range"] {
     width: 100%;
 }
