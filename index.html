@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Music Tool</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Music Tool</h1>
+            <p>Enter notes (Do, Re, Mi...) below to compose and play melody.</p>
+        </header>
+
+        <div class="controls-panel">
+            <div class="control-group">
+                <label for="instrument">Instrument:</label>
+                <select id="instrument">
+                    <option value="piano">Piano</option>
+                    <option value="guitar">Guitar</option>
+                    <option value="harmonica">Harmonica</option>
+                    <option value="clarinet">Clarinet</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label for="tempo">Tempo: <span id="tempo-value">120</span> BPM</label>
+                <input type="range" id="tempo" min="60" max="200" value="120">
+            </div>
+
+            <div class="control-group">
+                <label for="volume">Volume: <span id="volume-value">80</span>%</label>
+                <input type="range" id="volume" min="0" max="100" value="80">
+            </div>
+
+            <div class="button-group">
+                <button id="btn-play">Play</button>
+                <button id="btn-save">Save</button>
+                <button id="btn-load" onclick="document.getElementById('file-input').click()">Load</button>
+                <input type="file" id="file-input" accept=".txt" style="display: none;">
+            </div>
+        </div>
+
+        <div class="status-bar">
+            <span id="status-text">Ready</span>
+            <span id="error-text" class="error"></span>
+        </div>
+
+        <div class="workspace">
+            <div class="editor-section">
+                <h3>Composition</h3>
+                <textarea id="composition-input" placeholder="Example: Do Re Mi Fa Sol La Ti Do'&#10;Do' Si La Sol Fa Mi Re rest"></textarea>
+            </div>
+
+            <div class="visualizer-section">
+                <h3>Staff Visualization</h3>
+                <div id="canvas-container">
+                    <canvas id="staff-canvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
